@@ -4,8 +4,8 @@ import os
 # Time
 from datetime import datetime
 
-# AWS
-import boto3
+# Geocoding
+import googlemaps
 
 # United States
 import us
@@ -22,7 +22,6 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.ext.automap import automap_base 
 
-# This process aims to align with the latest and greatest practices of Data Engineering through the use of a Medallion Architecture 
 
 # Database credentials and connection setup
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -39,20 +38,8 @@ accidents_bronze = Base.classes.accidents_bronze
 accidents_silver = Base.classes.accidents_silver
 log = Base.classes.log
 
-# Getting secrets necessary for Amazon Geocoding Services
-aws_access_key_id = os.environ.get('aws_access_key_id')
-aws_secret_access_key = os.environ.get('aws_secret_access_key')
-region_name = os.environ.get('region_name')
-service_name = os.environ.get('service_name')
-place_index_name = os.environ.get('place_index_name')
-
-# Establishing connection to Amazon Web Services SDK
-client = boto3.client(
-    service_name=service_name,
-    region_name=region_name,
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key
-)
+google_maps_api_key = os.environ.get('GOOGLE_MAPS_API_KEY')
+gmaps = googlemaps.Client(key=google_maps_api_key)
 
 # Generated as a time stamp in seconds since 1970 for a unique reference (only if no others were created this day) 
 elt_job_id = '1705574460'
@@ -149,30 +136,55 @@ def convert_state_abbreviation(abbreviation):
     return state.name if state else abbreviation
 
 
-def geocode_address(place_index_name, location_text):
+def refine_location(state, location):
     try:
-        # Call Amazon Location Service to geocode the location
-        response = client.search_place_index_for_text(
-            IndexName=place_index_name,  # The name of your place index resource
-            Text=location_text  # Combined location and state
-        )
-        # Check if the response contains any results
-        if not response['Results']:
-            return None
-        # Extract latitude and longitude from response
-        coordinates = response['Results'][0]['Place']['Geometry']['Point']
-        return coordinates
-    except Exception as e:
-        error_message = f"An error has occurred while geocoding: {str(e)}"
-        return None, error_message 
-    
-    
-def split_coordinates(row):
-    if row['coordinates']:
-        # Directly assign longitude and latitude in the order they're returned
-        return pd.Series(row['coordinates'], index=['longitude', 'latitude'])
+        if ',' in location:
+            # Use the part after the last comma
+            last_comma_part = location.split(',')[-1].strip()
+            if ' of ' in last_comma_part:
+                # If 'of' is present in the last segment, use the part after 'of'
+                refined_location = last_comma_part.split(' of ', 1)[1]
+            else:
+                # If 'of' is not in the last segment, use this segment directly
+                refined_location = last_comma_part
+        elif ' of ' in location:
+            # If there are no commas but 'of' is present, use the part after 'of'
+            refined_location = location.split(' of ', 1)[1]
+        else:
+            # If neither 'of' nor commas are present, use the location as is
+            refined_location = location
+
+        return f"{refined_location.strip()}, {state}"
+    except Exception:
+        error_message = f"An error occurred while trying to refine location: {location}, {state}"
+        return None, error_message
+
+
+def geocode_location(location_text):
+    try:
+        # Use Google Maps to geocode the location
+        geocode_result = gmaps.geocode(location_text)
+        # Check if the geocode call returned results
+        if geocode_result:
+            # Extract latitude and longitude
+            latitude = geocode_result[0]['geometry']['location']['lat']
+            longitude = geocode_result[0]['geometry']['location']['lng']
+            return latitude, longitude
+        else:
+            return None, None
+    except Exception:
+        error_message = "An error occurred during geocoding"
+        return error_message
+
+
+def invalidate_cache(api_endpoint, api_key):
+    headers = {'access_token': api_key}
+    # Assuming no specific cache keys are provided to clear the entire cache
+    response = requests.post(api_endpoint, headers=headers, json={"keys": []})
+    if response.status_code == 200:
+        print("Cache invalidated successfully.")
     else:
-        return pd.Series((None, None), index=['longitude', 'latitude'])
+        print(f"Failed to invalidate cache: {response.text}")
     
 
 # URL to scrape from (permitted for research purposes: https://avalanche.state.co.us/accidents/statistics-and-reporting)
@@ -226,17 +238,14 @@ try:
               
         # Step 6: Convert state abbreviations to full names
         silver_df.loc[:, 'state'] = silver_df['state'].apply(lambda x: us.states.lookup(x).name if us.states.lookup(x) else x)
-        
-        # Step 7: Geocode each location to obtain coordinates
-        silver_df['coordinates'] = silver_df.apply(lambda x: geocode_address(place_index_name, f"{x['location']}, {x['state']}"), axis=1)
+                        
+        # Step 7: Refine Location for Geocoding purposes
+        silver_df['refined_location'] = silver_df.apply(lambda x: refine_location(x['state'], x['location']), axis=1)
             
-        # Step 8: Split coordinates into latitude and longitude
-        silver_df[['longitude', 'latitude']] = silver_df.apply(lambda row: split_coordinates(row), axis=1)
+        # Step 8: Geocode each refined location to obtain latitude and longitude directly
+        silver_df[['latitude', 'longitude']] = silver_df.apply(lambda x: pd.Series(geocode_location(x['refined_location'])), axis=1)
                
-        # Step 9: Drop the temporary 'coordinates' column
-        silver_df.drop(columns=['coordinates'], inplace=True)
-             
-        # Step 10: Inserting Transformed Data into Silver Table
+        # Step 9: Inserting Transformed Data into Silver Table
         append_to_sql(silver_df, 'accidents_silver', engine)
         
         db_session.commit()
@@ -249,7 +258,7 @@ try:
         success = True
 
 except Exception as e:
-    error_message = f"An Error has occurred during the transformation stage: {str(e)}"
+    error_message = "An Error has occurred during the transformation stage"
     db_session.rollback()  # Rollback any pending transactions
 
 finally:
@@ -259,6 +268,9 @@ finally:
     duration = end_time - start_time
 
     if success:
+        fast_api_endpoint = 'https://avalanchebackend.onrender.com/api/invalidate-cache/'
+        api_key = os.environ.get('PROD_FAST_API_KEY')
+        invalidate_cache(fast_api_endpoint, api_key)
         # Log Success
         insert_log(db_session, elt_job_id, start_time, end_time, duration, status, data_count)
     else:
