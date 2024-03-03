@@ -24,7 +24,7 @@ from sqlalchemy.ext.automap import automap_base
 
 
 # Database credentials and connection setup
-DATABASE_URL = os.environ.get('DATABASE_URL')
+DATABASE_URL = os.environ.get('PROD_DATABASE_URL')
 engine = create_engine(DATABASE_URL)
 
 Session = sessionmaker(bind=engine)
@@ -225,8 +225,12 @@ try:
         # Step 2: Select the Updated Bronze Table Containing All Records Including Recently Inserted
         df_bronze = pd.read_sql("SELECT * FROM accidents_bronze", con=engine)
         
+        print("starting data transformation")
+        
         # Step 3: Remove cross symbols if they exist
         df_bronze['date'] = df_bronze['date'].astype(str).str.replace("†", "", regex=False)
+        
+        print("crosses successfully removed")
         
         # Step 4: Transform 'date' column based on 'season' 
         df_bronze['date'] = df_bronze.apply(transform_date, axis=1)
@@ -238,13 +242,13 @@ try:
               
         # Step 6: Convert state abbreviations to full names
         silver_df.loc[:, 'state'] = silver_df['state'].apply(lambda x: us.states.lookup(x).name if us.states.lookup(x) else x)
-                        
+                      
         # Step 7: Refine Location for Geocoding purposes
         silver_df['refined_location'] = silver_df.apply(lambda x: refine_location(x['state'], x['location']), axis=1)
-            
+         
         # Step 8: Geocode each refined location to obtain latitude and longitude directly
         silver_df[['latitude', 'longitude']] = silver_df.apply(lambda x: pd.Series(geocode_location(x['refined_location'])), axis=1)
-               
+              
         # Step 9: Inserting Transformed Data into Silver Table
         append_to_sql(silver_df, 'accidents_silver', engine)
         
@@ -258,7 +262,7 @@ try:
         success = True
 
 except Exception as e:
-    error_message = "An Error has occurred during the transformation stage"
+    print(f"An Error has occurred during the transformation stage: {e}")
     db_session.rollback()  # Rollback any pending transactions
 
 finally:
