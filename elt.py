@@ -57,54 +57,67 @@ start_time = datetime.now()
 def scrape_and_parse(url):
     with requests.Session() as session:
         session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/58.0.3029.110 Safari/537.3'
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            )
         })
         try:
-            response = session.get(url)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.content, 'html.parser')
-                tables = soup.find_all('table', {'class': 'us_acc_table'})
-                all_data = []
+            response = session.get(url, timeout=30)
 
-                for table in tables:
-                    season_header = table.find_previous_sibling('h2')
-                    season = season_header.text.split(' SEASON')[0] if season_header else 'Season Unknown'
+            if response.status_code != 200:
+                error_message = (
+                    f"Failed to fetch the webpage. Status code: {response.status_code}. "
+                    f"First 200 chars: {response.text[:200]}"
+                )
+                return None, error_message
 
-                    for row in table.find_all('tr')[1:]:
-                        cells = row.find_all('td')
-                        if len(cells) >= 5:
-                            accident_data = {
-                                'season': season,
-                                'date': cells[0].text.strip(),
-                                'state': cells[1].text.strip(),
-                                'location': cells[2].text.strip(),
-                                'description': cells[3].text.strip(),
-                                'fatalities': cells[4].text.strip()
-                            }
-                            all_data.append(accident_data)
-                return all_data, None  # Return the data and indicate no error
-            else:
-                # If status_code is not 200, construct an error message
-                error_message = f"Failed to fetch the webpage. Status code: {response.status_code}"
-                return None, error_message  # Return no data and the error message
+            soup = BeautifulSoup(response.content, "html.parser")
+            tables = soup.find_all("table", {"class": "us_acc_table"})
+            all_data = []
+
+            if not tables:
+                return None, "No tables found on page (us_acc_table missing). Page HTML may have changed."
+
+            for table in tables:
+                season_header = table.find_previous_sibling("h2")
+                season = season_header.text.split(" SEASON")[0] if season_header else "Season Unknown"
+
+                for row in table.find_all("tr")[1:]:
+                    cells = row.find_all("td")
+                    if len(cells) >= 5:
+                        accident_data = {
+                            "season": season,
+                            "date": cells[0].text.strip(),
+                            "state": cells[1].text.strip(),
+                            "location": cells[2].text.strip(),
+                            "description": cells[3].text.strip(),
+                            "fatalities": cells[4].text.strip(),
+                        }
+                        all_data.append(accident_data)
+
+            return all_data, None
+
         except Exception as e:
-            # Handle any other exceptions that may occur and construct an error message
             error_message = f"An error occurred while trying to scrape and parse {url}: {str(e)}"
-            return None, error_message  # Return no data and the error message
+            return None, error_message
+
         
         
 # Returns full date from season and partial date
 def transform_date(row):
-    date_text = row['date']
-    season = row['season']
-    
+    date_text = row["date"]
+    season = row["season"]
+
     try:
-        month, day = map(int, date_text.split('/'))
-        year = int(season.split('-')[0]) if month > 6 else int(season.split('-')[1])
-        return datetime(year, month, day).strftime('%Y-%m-%d')
-    except Exception as e:
-        error_message = f"An error occurred while trying to transform date {row}: {str(e)}"
-        return None, error_message
+        month, day = map(int, str(date_text).split("/"))
+        year = int(season.split("-")[0]) if month > 6 else int(season.split("-")[1])
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except Exception:
+        # Return a single value (None) so df.apply doesn't get tuples
+        return None
+
     
 
 def append_to_sql(df, table_name, engine):
@@ -138,26 +151,24 @@ def convert_state_abbreviation(abbreviation):
 
 def refine_location(state, location):
     try:
-        if ',' in location:
-            # Use the part after the last comma
-            last_comma_part = location.split(',')[-1].strip()
-            if ' of ' in last_comma_part:
-                # If 'of' is present in the last segment, use the part after 'of'
-                refined_location = last_comma_part.split(' of ', 1)[1]
+        if not location:
+            return None
+
+        if "," in location:
+            last_comma_part = location.split(",")[-1].strip()
+            if " of " in last_comma_part:
+                refined_location = last_comma_part.split(" of ", 1)[1]
             else:
-                # If 'of' is not in the last segment, use this segment directly
                 refined_location = last_comma_part
-        elif ' of ' in location:
-            # If there are no commas but 'of' is present, use the part after 'of'
-            refined_location = location.split(' of ', 1)[1]
+        elif " of " in location:
+            refined_location = location.split(" of ", 1)[1]
         else:
-            # If neither 'of' nor commas are present, use the location as is
             refined_location = location
 
         return f"{refined_location.strip()}, {state}"
     except Exception:
-        error_message = f"An error occurred while trying to refine location: {location}, {state}"
-        return None, error_message
+        return None
+
 
 
 def geocode_location(location_text):
@@ -173,8 +184,7 @@ def geocode_location(location_text):
         else:
             return None, None
     except Exception:
-        error_message = "An error occurred during geocoding"
-        return error_message
+        return None, None
 
 
 def invalidate_cache(api_endpoint, api_key):
@@ -193,8 +203,33 @@ url = "https://classic.avalanche.state.co.us/caic/acc/acc_us.php"
 # Scrape new data
 new_data, error_message = scrape_and_parse(url)
 
+# If scrape failed, log + exit cleanly (prevents len(None) crash)
+if new_data is None:
+    print(f"❌ Scrape failed: {error_message}")
+
+    db_session = Session()
+    try:
+        status = "Failure"
+        end_time = datetime.now()
+        duration = end_time - start_time
+        insert_log(
+            db_session=db_session,
+            elt_job_id=elt_job_id,
+            start_time=start_time,
+            end_time=end_time,
+            duration=duration,
+            status=status,
+            data_count=0,
+            error_message=error_message,
+        )
+    finally:
+        db_session.close()
+
+    raise SystemExit(1)
+
 # Get count of new_data
 new_data_count = len(new_data)
+
 
 # Get count of current SQL bronze
 current_bronze_count_query = "SELECT COUNT(*) FROM accidents_bronze"
@@ -215,55 +250,62 @@ db_session = Session()
 data_count = 0
 
 try:
-    
     db_session.begin()
     
     if not new_df.empty:  # If there are records to add
         # Step 1: Insert Raw Data into Bronze Table
         append_to_sql(new_df, 'accidents_bronze', engine)
-
+        print("Step 1: Raw data inserted into bronze table.")
+        
         # Step 2: Select the Updated Bronze Table Containing All Records Including Recently Inserted
         df_bronze = pd.read_sql("SELECT * FROM accidents_bronze", con=engine)
+        print("Step 2: Data selected from bronze table. Shape:", df_bronze.shape)
         
-        print("starting data transformation")
+        print("Starting data transformation...")
         
         # Step 3: Remove cross symbols if they exist
         df_bronze['date'] = df_bronze['date'].astype(str).str.replace("†", "", regex=False)
+        print("Step 3: Cross symbols removed. Sample data:", df_bronze['date'].head())
         
-        print("crosses successfully removed")
-        
-        # Step 4: Transform 'date' column based on 'season' 
+        # Step 4: Transform 'date' column based on 'season'
         df_bronze['date'] = df_bronze.apply(transform_date, axis=1)
+        print("Step 4: Date transformed. Sample data:", df_bronze['date'].head())
         
         # Step 5: Create a Silver DataFrame for Transformations
-        # Remove summary tables and apply transformations
         headers_to_look_for = {'date', 'state', 'location', 'description', 'fatalities', 'season'}
         silver_df = df_bronze[df_bronze.columns.intersection(headers_to_look_for)]
-              
+        print("Step 5: Silver DataFrame created. Shape:", silver_df.shape)
+        
         # Step 6: Convert state abbreviations to full names
         silver_df.loc[:, 'state'] = silver_df['state'].apply(lambda x: us.states.lookup(x).name if us.states.lookup(x) else x)
-                      
+        print("Step 6: State names converted. Sample data:", silver_df['state'].head())
+        
         # Step 7: Refine Location for Geocoding purposes
         silver_df['refined_location'] = silver_df.apply(lambda x: refine_location(x['state'], x['location']), axis=1)
-         
+        print("Step 7: Locations refined. Sample data:", silver_df['refined_location'].head())
+        
         # Step 8: Geocode each refined location to obtain latitude and longitude directly
         silver_df[['latitude', 'longitude']] = silver_df.apply(lambda x: pd.Series(geocode_location(x['refined_location'])), axis=1)
-              
+        print("Step 8: Geocoding completed. Sample data:", silver_df[['latitude', 'longitude']].head())
+        
         # Step 9: Inserting Transformed Data into Silver Table
         append_to_sql(silver_df, 'accidents_silver', engine)
+        print("Step 9: Transformed data inserted into silver table.")
         
         db_session.commit()
-
+        print("Data transformation and loading completed successfully.")
+        
         # Set count of records
         data_count = len(new_df)
         success = True
     else:
-        # Can still be a successful run with no data to bring in
+        print("No new data to process.")
         success = True
 
 except Exception as e:
     print(f"An Error has occurred during the transformation stage: {e}")
-    db_session.rollback()  # Rollback any pending transactions
+    db_session.rollback()
+
 
 finally:
     # This block executes whether there was an error or not
