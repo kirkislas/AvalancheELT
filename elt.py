@@ -237,6 +237,7 @@ def parse_fatalities(record: Dict[str, Any]) -> Optional[int]:
 
 
 
+
 # ISO date extraction helper
 def safe_iso_date(record: Dict[str, Any]) -> Optional[str]:
     observed_at = record.get("observed_at") or record.get("observation_date")
