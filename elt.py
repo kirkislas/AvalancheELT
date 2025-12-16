@@ -461,58 +461,39 @@ def main() -> None:
         # PAGINATED FETCH
         # -------------------------
         page = 1
-        all_raw: List[Dict[str, Any]] = []
+        all_records: List[Dict[str, Any]] = []
 
         while True:
             page_url = f"{API_URL}?page={page}"
-
             raw_data, fetch_error = fetch_api_json(page_url, MAX_RETRIES, REQUEST_TIMEOUT)
+
+            # Stop condition: API explicitly says page is out of range
+            if raw_data is None and fetch_error and "expected :page" in fetch_error and "got" in fetch_error:
+                print(f"Pagination complete. API rejected page {page}: {fetch_error}")
+                break
+
+            # Any other failure is a real error
             if raw_data is None:
                 raise RuntimeError(fetch_error or f"API returned no data on page {page}")
 
-            if not isinstance(raw_data, list):
-                raise RuntimeError(f"Expected list from API on page {page}, got: {type(raw_data)}")
-
-            if len(raw_data) == 0:
-                print(f"Pagination complete. No records returned on page {page}.")
+            if not isinstance(raw_data, list) or not raw_data:
+                print(f"No records returned on page {page}. Pagination complete.")
                 break
 
-            all_raw.extend(raw_data)
-            print(f"Fetched page {page}: {len(raw_data)} records (running total: {len(all_raw)})")
+            all_records.extend(raw_data)
+            print(f"Fetched page {page}: {len(raw_data)} records (running total: {len(all_records)})")
 
             page += 1
 
-            # Safety guard (prevents infinite loops if API misbehaves)
-            if page > 500:
-                raise RuntimeError("Pagination exceeded 500 pages; stopping to prevent infinite loop.")
-
-        print(f"Fetched {len(all_raw)} total records from API across {page - 1} pages.")
+        if not all_records:
+            raise RuntimeError("No records fetched from API.")
 
         # -------------------------
-        # DEBUG: inspect one record
-        # -------------------------
-        if all_raw:
-            sample = all_raw[0]
-            if isinstance(sample, dict):
-                print("DEBUG sample keys:", list(sample.keys()))
-                for k in ["fatalities", "killed", "deaths", "number_of_fatalities", "involvement_summary"]:
-                    print(f"DEBUG sample.{k} =", sample.get(k))
-
-                prd = sample.get("public_report_detail") or {}
-                if isinstance(prd, dict):
-                    print("DEBUG public_report_detail keys:", list(prd.keys()))
-                    for k in ["fatalities", "killed", "deaths", "number_of_fatalities"]:
-                        print(f"DEBUG public_report_detail.{k} =", prd.get(k))
-                else:
-                    print("DEBUG public_report_detail type:", type(prd))
-            else:
-                print("DEBUG first record is not a dict:", type(sample))
-
-        # -------------------------
-        # NORMALIZE
+        # NORMALIZATION
         # -------------------------
         normalized_records: List[Dict[str, Any]] = []
-        for record in all_raw:
+
+        for record in all_records:
             if not isinstance(record, dict):
                 continue
             normalized = normalize_record(record)
@@ -521,42 +502,49 @@ def main() -> None:
 
         print(f"Normalized {len(normalized_records)} records.")
 
-        # DEBUG: fatalities coverage after normalization
-        non_null_fatalities = sum(1 for r in normalized_records if r.get("fatalities") is not None)
+        # DEBUG: fatalities coverage
+        non_null_fatalities = sum(
+            1 for r in normalized_records if r.get("fatalities") is not None
+        )
         print(f"DEBUG fatalities non-null after normalize: {non_null_fatalities}/{len(normalized_records)}")
 
         if not normalized_records:
-            print("No valid records available for processing.")
+            print("No valid records available after normalization.")
             status = "Success"
-        else:
-            # -------------------------
-            # GEOCODE ENRICHMENT
-            # -------------------------
-            missing_before = sum(
-                1 for record in normalized_records
-                if record.get("latitude") is None and record.get("longitude") is None
-            )
-            enrich_with_geocoding(normalized_records)
-            missing_after = sum(
-                1 for record in normalized_records
-                if record.get("latitude") is None and record.get("longitude") is None
-            )
-            print(f"Geocode fill: {missing_before - missing_after} filled, {missing_after} still missing.")
+            return
 
-            # -------------------------
-            # UPSERT
-            # -------------------------
-            bronze_payload = build_bronze_payload(normalized_records)
-            silver_payload = build_silver_payload(normalized_records)
+        # -------------------------
+        # GEOCODING ENRICHMENT
+        # -------------------------
+        missing_before = sum(
+            1 for r in normalized_records
+            if r.get("latitude") is None and r.get("longitude") is None
+        )
 
-            with engine.begin() as conn:
-                inserted_bronze = upsert_records(conn, accidents_bronze, bronze_payload)
-                print(f"Inserted {inserted_bronze} bronze records.")
-                inserted_silver = upsert_records(conn, accidents_silver, silver_payload)
-                print(f"Inserted {inserted_silver} silver records.")
+        enrich_with_geocoding(normalized_records)
 
-            data_count = inserted_silver
-            status = "Success"
+        missing_after = sum(
+            1 for r in normalized_records
+            if r.get("latitude") is None and r.get("longitude") is None
+        )
+
+        print(f"Geocode fill: {missing_before - missing_after} filled, {missing_after} still missing.")
+
+        # -------------------------
+        # UPSERT (APPEND-ONLY)
+        # -------------------------
+        bronze_payload = build_bronze_payload(normalized_records)
+        silver_payload = build_silver_payload(normalized_records)
+
+        with engine.begin() as conn:
+            inserted_bronze = upsert_records(conn, accidents_bronze, bronze_payload)
+            print(f"Inserted {inserted_bronze} bronze records.")
+
+            inserted_silver = upsert_records(conn, accidents_silver, silver_payload)
+            print(f"Inserted {inserted_silver} silver records.")
+
+        data_count = inserted_silver
+        status = "Success"
 
     except Exception as run_err:
         error_message = str(run_err)
@@ -581,6 +569,7 @@ def main() -> None:
 
         if status == "Success":
             invalidate_cache(CACHE_INVALIDATION_ENDPOINT, FAST_API_KEY)
+
 
 
 
