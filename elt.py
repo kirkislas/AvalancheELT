@@ -457,18 +457,42 @@ def main() -> None:
     data_count = 0
 
     try:
-        raw_data, fetch_error = fetch_api_json(API_URL, MAX_RETRIES, REQUEST_TIMEOUT)
-        if raw_data is None:
-            raise RuntimeError(fetch_error or "API returned no data")
+        # -------------------------
+        # PAGINATED FETCH
+        # -------------------------
+        page = 1
+        all_raw: List[Dict[str, Any]] = []
 
-        total_fetched = len(raw_data) if isinstance(raw_data, list) else 0
-        print(f"Fetched {total_fetched} records from API.")
+        while True:
+            page_url = f"{API_URL}?page={page}"
+
+            raw_data, fetch_error = fetch_api_json(page_url, MAX_RETRIES, REQUEST_TIMEOUT)
+            if raw_data is None:
+                raise RuntimeError(fetch_error or f"API returned no data on page {page}")
+
+            if not isinstance(raw_data, list):
+                raise RuntimeError(f"Expected list from API on page {page}, got: {type(raw_data)}")
+
+            if len(raw_data) == 0:
+                print(f"Pagination complete. No records returned on page {page}.")
+                break
+
+            all_raw.extend(raw_data)
+            print(f"Fetched page {page}: {len(raw_data)} records (running total: {len(all_raw)})")
+
+            page += 1
+
+            # Safety guard (prevents infinite loops if API misbehaves)
+            if page > 500:
+                raise RuntimeError("Pagination exceeded 500 pages; stopping to prevent infinite loop.")
+
+        print(f"Fetched {len(all_raw)} total records from API across {page - 1} pages.")
 
         # -------------------------
         # DEBUG: inspect one record
         # -------------------------
-        if isinstance(raw_data, list) and raw_data:
-            sample = raw_data[0]
+        if all_raw:
+            sample = all_raw[0]
             if isinstance(sample, dict):
                 print("DEBUG sample keys:", list(sample.keys()))
                 for k in ["fatalities", "killed", "deaths", "number_of_fatalities", "involvement_summary"]:
@@ -484,13 +508,17 @@ def main() -> None:
             else:
                 print("DEBUG first record is not a dict:", type(sample))
 
+        # -------------------------
+        # NORMALIZE
+        # -------------------------
         normalized_records: List[Dict[str, Any]] = []
-        for record in raw_data:
+        for record in all_raw:
             if not isinstance(record, dict):
                 continue
             normalized = normalize_record(record)
             if normalized:
                 normalized_records.append(normalized)
+
         print(f"Normalized {len(normalized_records)} records.")
 
         # DEBUG: fatalities coverage after normalization
@@ -501,6 +529,9 @@ def main() -> None:
             print("No valid records available for processing.")
             status = "Success"
         else:
+            # -------------------------
+            # GEOCODE ENRICHMENT
+            # -------------------------
             missing_before = sum(
                 1 for record in normalized_records
                 if record.get("latitude") is None and record.get("longitude") is None
@@ -512,6 +543,9 @@ def main() -> None:
             )
             print(f"Geocode fill: {missing_before - missing_after} filled, {missing_after} still missing.")
 
+            # -------------------------
+            # UPSERT
+            # -------------------------
             bronze_payload = build_bronze_payload(normalized_records)
             silver_payload = build_silver_payload(normalized_records)
 
@@ -531,6 +565,7 @@ def main() -> None:
     finally:
         end_time = datetime.utcnow()
         duration = end_time - start_time
+
         try:
             insert_log(
                 elt_job_id=ELT_JOB_ID,
@@ -546,6 +581,7 @@ def main() -> None:
 
         if status == "Success":
             invalidate_cache(CACHE_INVALIDATION_ENDPOINT, FAST_API_KEY)
+
 
 
 # Entrypoint
