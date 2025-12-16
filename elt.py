@@ -60,7 +60,11 @@ GEOCODE_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
 
 
 # Fetch API JSON helper
-def fetch_api_json(url: str, max_retries: int = MAX_RETRIES, timeout: int = REQUEST_TIMEOUT) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+def fetch_api_json(
+    url: str,
+    max_retries: int = MAX_RETRIES,
+    timeout: int = REQUEST_TIMEOUT
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     last_err = None
     backoff = 2
 
@@ -443,8 +447,29 @@ def main() -> None:
         raw_data, fetch_error = fetch_api_json(API_URL, MAX_RETRIES, REQUEST_TIMEOUT)
         if raw_data is None:
             raise RuntimeError(fetch_error or "API returned no data")
+
         total_fetched = len(raw_data) if isinstance(raw_data, list) else 0
         print(f"Fetched {total_fetched} records from API.")
+
+        # -------------------------
+        # DEBUG: inspect one record
+        # -------------------------
+        if isinstance(raw_data, list) and raw_data:
+            sample = raw_data[0]
+            if isinstance(sample, dict):
+                print("DEBUG sample keys:", list(sample.keys()))
+                for k in ["fatalities", "killed", "deaths", "number_of_fatalities", "involvement_summary"]:
+                    print(f"DEBUG sample.{k} =", sample.get(k))
+
+                prd = sample.get("public_report_detail") or {}
+                if isinstance(prd, dict):
+                    print("DEBUG public_report_detail keys:", list(prd.keys()))
+                    for k in ["fatalities", "killed", "deaths", "number_of_fatalities"]:
+                        print(f"DEBUG public_report_detail.{k} =", prd.get(k))
+                else:
+                    print("DEBUG public_report_detail type:", type(prd))
+            else:
+                print("DEBUG first record is not a dict:", type(sample))
 
         normalized_records: List[Dict[str, Any]] = []
         for record in raw_data:
@@ -455,16 +480,22 @@ def main() -> None:
                 normalized_records.append(normalized)
         print(f"Normalized {len(normalized_records)} records.")
 
+        # DEBUG: fatalities coverage after normalization
+        non_null_fatalities = sum(1 for r in normalized_records if r.get("fatalities") is not None)
+        print(f"DEBUG fatalities non-null after normalize: {non_null_fatalities}/{len(normalized_records)}")
+
         if not normalized_records:
             print("No valid records available for processing.")
             status = "Success"
         else:
             missing_before = sum(
-                1 for record in normalized_records if record.get("latitude") is None and record.get("longitude") is None
+                1 for record in normalized_records
+                if record.get("latitude") is None and record.get("longitude") is None
             )
             enrich_with_geocoding(normalized_records)
             missing_after = sum(
-                1 for record in normalized_records if record.get("latitude") is None and record.get("longitude") is None
+                1 for record in normalized_records
+                if record.get("latitude") is None and record.get("longitude") is None
             )
             print(f"Geocode fill: {missing_before - missing_after} filled, {missing_after} still missing.")
 
