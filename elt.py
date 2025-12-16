@@ -190,6 +190,7 @@ def refine_location(state, location):
 
 # Fatality parsing helper
 def parse_fatalities(record: Dict[str, Any]) -> Optional[int]:
+    # 1) Direct/top-level fields
     candidate_fields = [
         record.get("fatalities"),
         record.get("killed"),
@@ -204,14 +205,24 @@ def parse_fatalities(record: Dict[str, Any]) -> Optional[int]:
         except (ValueError, TypeError):
             continue
 
+    # 2) involvement_summary can be a dict (your case)
     involvement = record.get("involvement_summary")
+    if isinstance(involvement, dict):
+        killed = involvement.get("killed") or involvement.get("fatalities") or involvement.get("deaths")
+        if killed is not None:
+            try:
+                return int(killed)
+            except (ValueError, TypeError):
+                return None
+
+    # 3) involvement_summary can be a list of dicts (keep your existing support)
     if isinstance(involvement, list):
         total = 0
         found = False
         for entry in involvement:
             if not isinstance(entry, dict):
                 continue
-            killed = entry.get("killed") or entry.get("fatalities")
+            killed = entry.get("killed") or entry.get("fatalities") or entry.get("deaths")
             if killed is None:
                 continue
             try:
@@ -223,6 +234,7 @@ def parse_fatalities(record: Dict[str, Any]) -> Optional[int]:
             return total
 
     return None
+
 
 
 # ISO date extraction helper
