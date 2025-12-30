@@ -8,6 +8,15 @@ from datetime import datetime, timezone
 # Typing
 from typing import Any, Dict, List, Optional, Tuple
 
+# HTML parsing helpers
+from html import unescape
+
+# Regex
+import re
+
+# Logging
+import logging
+
 # Geocoding
 import googlemaps
 
@@ -18,7 +27,7 @@ import us
 import requests
 
 # Database Interaction
-from sqlalchemy import MetaData, Table, create_engine
+from sqlalchemy import MetaData, Table, create_engine, select, func
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 
@@ -34,6 +43,16 @@ ELT_JOB_ID = str(int(datetime.now(timezone.utc).timestamp()))
 DATABASE_URL = os.environ.get("PROD_DATABASE_URL")
 FAST_API_KEY = os.environ.get("PROD_FAST_API_KEY")
 GOOGLE_MAPS_API_KEY = os.environ.get("GOOGLE_MAPS_API_KEY")
+REBUILD_SILVER_FROM_ALL_BRONZE = (
+    os.environ.get("REBUILD_SILVER_FROM_ALL_BRONZE", "false").strip().lower() in {"1", "true", "yes", "y"}
+)
+MAX_GEOCODE_PER_RUN = int(os.environ.get("MAX_GEOCODE_PER_RUN", "50"))
+DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
 
 if not DATABASE_URL:
     raise RuntimeError("PROD_DATABASE_URL environment variable is required")
@@ -53,10 +72,39 @@ if GOOGLE_MAPS_API_KEY:
     try:
         gmaps_client = googlemaps.Client(key=GOOGLE_MAPS_API_KEY)
     except Exception as gmaps_err:
-        print(f"Google Maps client initialization failed: {gmaps_err}")
+        logging.warning("Google Maps client initialization failed: %s", gmaps_err)
         gmaps_client = None
 
 GEOCODE_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+MOUNTAIN_STATES = {
+    "Alaska",
+    "California",
+    "Colorado",
+    "Idaho",
+    "Montana",
+    "Nevada",
+    "New Hampshire",
+    "New Mexico",
+    "Oregon",
+    "Utah",
+    "Vermont",
+    "Washington",
+    "Wyoming",
+}
+SILVER_REQUIRED_FIELDS = ["source_id", "date", "state", "location"]
+
+
+def parse_page_out_of_range(response: requests.Response) -> Tuple[bool, Optional[str]]:
+    try:
+        payload = response.json()
+    except ValueError:
+        return False, None
+    message = payload.get("message") or payload.get("error")
+    if isinstance(message, str):
+        lowered = message.lower()
+        if "expected" in lowered and ":page" in lowered and "got" in lowered:
+            return True, message
+    return False, None
 
 
 # Fetch API JSON helper
@@ -64,7 +112,7 @@ def fetch_api_json(
     url: str,
     max_retries: int = MAX_RETRIES,
     timeout: int = REQUEST_TIMEOUT
-) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+) -> Tuple[Optional[List[Dict[str, Any]]], bool, Optional[str]]:
     last_err = None
     backoff = 2
 
@@ -80,14 +128,21 @@ def fetch_api_json(
 
                 if response.status_code == 200:
                     try:
-                        return response.json(), None
+                        return response.json(), False, None
                     except Exception as json_err:
-                        return None, f"JSON decode failed: {json_err}. Snippet: {response.text[:200]}"
+                        return None, False, f"JSON decode failed: {json_err}. Snippet: {response.text[:200]}"
+
+                if response.status_code == 400:
+                    stop, message = parse_page_out_of_range(response)
+                    if stop:
+                        return None, True, message
+                    last_err = f"HTTP 400. Body: {response.text[:200]}"
+                    break
 
                 if response.status_code in (429, 500, 502, 503, 504):
                     last_err = f"HTTP {response.status_code}. Snippet: {response.text[:200]}"
                 else:
-                    return None, f"HTTP {response.status_code}. Snippet: {response.text[:200]}"
+                    return None, False, f"HTTP {response.status_code}. Snippet: {response.text[:200]}"
 
             except Exception as req_err:
                 last_err = f"Request error: {req_err}"
@@ -95,7 +150,7 @@ def fetch_api_json(
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
-    return None, f"Fetch failed after retries. Last error: {last_err}"
+    return None, False, f"Fetch failed after retries. Last error: {last_err}"
 
 
 # Logging helper
@@ -125,18 +180,18 @@ def insert_log(
 # Cache invalidation helper
 def invalidate_cache(api_endpoint: str, api_key: Optional[str]) -> None:
     if not api_endpoint or not api_key:
-        print("Cache invalidation skipped: missing endpoint or API key.")
+        logging.info("Cache invalidation skipped: missing endpoint or API key.")
         return
 
     try:
         headers = {"access_token": api_key}
         response = requests.post(api_endpoint, headers=headers, json={"keys": []}, timeout=15)
         if response.status_code == 200:
-            print("Cache invalidated successfully.")
+            logging.info("Cache invalidated successfully.")
         else:
-            print(f"Failed to invalidate cache: HTTP {response.status_code} - {response.text}")
+            logging.warning("Failed to invalidate cache: HTTP %s - %s", response.status_code, response.text)
     except Exception as cache_err:
-        print(f"Cache invalidation error: {cache_err}")
+        logging.error("Cache invalidation error: %s", cache_err)
 
 
 # State conversion helper
@@ -185,53 +240,64 @@ def refine_location(state, location):
             return f"{refined_location}, {state}"
         return refined_location
     except Exception:
+        logging.exception("Refine location failed for state=%s location=%s", state, location)
         return None
+
+
+def strip_html(text: Optional[str]) -> Optional[str]:
+    if not isinstance(text, str):
+        return None
+    working = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    working = re.sub(r"(?i)</p>\s*<p>", "\n\n", working)
+    working = re.sub(r"(?i)</?p>", "\n\n", working)
+    working = re.sub(r"(?i)</?span[^>]*>", "", working)
+    working = re.sub(
+        r"(?is)<a[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>",
+        r"\2 (\1)",
+        working,
+    )
+    working = re.sub(r"<[^>]+>", " ", working)
+    working = unescape(working)
+    working = working.replace("\r", "")
+    working = re.sub(r"[ \t]+", " ", working)
+    working = re.sub(r"\n{3,}", "\n\n", working)
+    lines = [line.strip() for line in working.split("\n")]
+    working = "\n".join(lines)
+    working = re.sub(r"\n{3,}", "\n\n", working).strip()
+    return working or None
 
 
 # Fatality parsing helper
 def parse_fatalities(record: Dict[str, Any]) -> Optional[int]:
-    # 1) Direct/top-level fields
-    candidate_fields = [
-        record.get("fatalities"),
-        record.get("killed"),
-        record.get("deaths"),
-        record.get("number_of_fatalities"),
-    ]
-    for value in candidate_fields:
+    def to_int(value: Any) -> Optional[int]:
         if value is None:
-            continue
+            return None
         try:
             return int(value)
         except (ValueError, TypeError):
-            continue
+            return None
 
-    # 2) involvement_summary can be a dict (your case)
     involvement = record.get("involvement_summary")
-    if isinstance(involvement, dict):
-        killed = involvement.get("killed") or involvement.get("fatalities") or involvement.get("deaths")
-        if killed is not None:
-            try:
-                return int(killed)
-            except (ValueError, TypeError):
-                return None
+    if isinstance(involvement, dict) and "killed" in involvement:
+        killed_value = involvement.get("killed")
+        if killed_value is not None:
+            parsed = to_int(killed_value)
+            if parsed is not None:
+                return parsed
 
-    # 3) involvement_summary can be a list of dicts (keep your existing support)
-    if isinstance(involvement, list):
-        total = 0
-        found = False
-        for entry in involvement:
-            if not isinstance(entry, dict):
-                continue
-            killed = entry.get("killed") or entry.get("fatalities") or entry.get("deaths")
-            if killed is None:
-                continue
-            try:
-                total += int(killed)
-                found = True
-            except (ValueError, TypeError):
-                continue
-        if found:
-            return total
+    public_detail = record.get("public_report_detail") or {}
+    detail_summary = public_detail.get("involvement_summary")
+    if isinstance(detail_summary, str):
+        match = re.search(r"(?<!\d)(\d+)\s*killed", detail_summary, re.IGNORECASE)
+        if match:
+            parsed = to_int(match.group(1))
+            if parsed is not None:
+                return parsed
+
+    for field in ("fatalities", "killed", "deaths", "number_of_fatalities"):
+        parsed = to_int(record.get(field))
+        if parsed is not None:
+            return parsed
 
     return None
 
@@ -285,6 +351,16 @@ def derive_season(record: Dict[str, Any], iso_date: Optional[str]) -> Optional[s
         return None
 
 
+def format_display_date(iso_date: Optional[str]) -> Optional[str]:
+    if not iso_date:
+        return None
+    try:
+        date_obj = datetime.strptime(iso_date, "%Y-%m-%d")
+        return date_obj.strftime("%m-%d-%Y")
+    except ValueError:
+        return None
+
+
 # Coordinate parsing helper
 def extract_coordinates(record: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     def pull_from_obj(obj: Any) -> Tuple[Optional[float], Optional[float]]:
@@ -330,30 +406,58 @@ def extract_coordinates(record: Dict[str, Any]) -> Tuple[Optional[float], Option
     return None, None
 
 
-# Record normalization helper
-def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    raw_source = record.get("id")
-    if raw_source is None:
-        raw_source = record.get("uuid")
+# Source identifier helper
+def extract_source_id(record: Dict[str, Any]) -> Optional[str]:
+    raw_source = record.get("id") or record.get("uuid")
     if raw_source is None:
         return None
     source_id = f"caic:{str(raw_source).strip()}"
     if not source_id or source_id == "caic:":
         return None
+    return source_id
+
+
+# Record normalization helper
+def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    source_id = extract_source_id(record)
+    if not source_id:
+        return None
 
     iso_date = safe_iso_date(record)
     season = derive_season(record, iso_date)
+    display_date = format_display_date(iso_date)
 
     public_detail = record.get("public_report_detail") or {}
     location_value = public_detail.get("location") or record.get("location")
     if isinstance(location_value, dict):
         location_value = location_value.get("name") or location_value.get("description")
-    description = (
+    summary_description = None
+    detail_summary = public_detail.get("involvement_summary")
+    if isinstance(detail_summary, str):
+        summary_description = strip_html(detail_summary)
+    if not summary_description:
+        involvement_summary = record.get("involvement_summary")
+        if isinstance(involvement_summary, dict):
+            parts: List[str] = []
+            for key in ["involved", "caught", "buried", "injured", "killed"]:
+                value = involvement_summary.get(key)
+                if value is None:
+                    continue
+                value_str = str(value).strip()
+                if not value_str:
+                    continue
+                parts.append(f"{value_str} {key}")
+            if parts:
+                summary_description = ", ".join(parts)
+
+    full_text_source = (
         public_detail.get("accident_summary")
         or public_detail.get("accident_summary_markdown")
         or public_detail.get("event_description")
-        or record.get("description")
     )
+    full_description = strip_html(full_text_source)
+    if not full_description:
+        full_description = strip_html(record.get("description"))
 
     state_value = convert_state_name(record.get("state") or record.get("state_abbr"))
     fatalities = parse_fatalities(record)
@@ -364,9 +468,11 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "source_id": source_id,
         "season": season,
         "date": iso_date,
+        "display_date": display_date,
         "state": state_value,
         "location": location_value,
-        "description": description,
+        "summary_description": summary_description,
+        "full_description": full_description,
         "fatalities": fatalities,
         "latitude": latitude,
         "longitude": longitude,
@@ -395,41 +501,162 @@ def geocode_location(location_text: Optional[str]) -> Tuple[Optional[float], Opt
                 time.sleep(0.2)
                 return lat, lng
     except Exception as geo_err:
-        print(f"Geocoding failed for '{location_text}': {geo_err}")
+        logging.warning("Geocoding failed for '%s': %s", location_text, geo_err)
 
     GEOCODE_CACHE[cache_key] = (None, None)
     return None, None
 
 
 # Geocoding enrichment helper
-def enrich_with_geocoding(records: List[Dict[str, Any]]) -> None:
+def enrich_with_geocoding(records: List[Dict[str, Any]], max_attempts: int = MAX_GEOCODE_PER_RUN) -> Dict[str, int]:
+    stats = {"attempted": 0, "succeeded": 0, "skipped_cap": 0}
+    if not gmaps_client or max_attempts <= 0:
+        return stats
+
     for record in records:
         lat = record.get("latitude")
         lon = record.get("longitude")
         refined = record.get("refined_location")
         needs_geo = (lat is None and lon is None) and isinstance(refined, str) and refined.strip()
         if needs_geo:
+            if stats["attempted"] >= max_attempts:
+                stats["skipped_cap"] += 1
+                continue
             geo_lat, geo_lon = geocode_location(refined)
+            stats["attempted"] += 1
             if geo_lat is not None and geo_lon is not None:
                 record["latitude"] = geo_lat
                 record["longitude"] = geo_lon
+                stats["succeeded"] += 1
+    return stats
+
+def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    skip_stats: Dict[str, Dict[str, Any]] = {
+        "missing_coordinates": {"count": 0, "samples": []},
+        "missing_refined_location": {"count": 0, "samples": []},
+        "missing_descriptions": {"count": 0, "samples": []},
+        "state_not_mountain": {"count": 0, "samples": []},
+    }
+    filtered: List[Dict[str, Any]] = []
+
+    def record_skip(reason: str, record: Dict[str, Any]) -> None:
+        info = skip_stats[reason]
+        info["count"] += 1
+        if len(info["samples"]) < 5:
+            info["samples"].append(record.get("source_id"))
+
+    for record in records:
+        lat = record.get("latitude")
+        lon = record.get("longitude")
+        if lat is None or lon is None:
+            record_skip("missing_coordinates", record)
+            continue
+
+        refined = record.get("refined_location")
+        if not isinstance(refined, str) or not refined.strip():
+            record_skip("missing_refined_location", record)
+            continue
+
+        summary_value = record.get("summary_description")
+        full_value = record.get("full_description")
+        summary_text = summary_value.strip() if isinstance(summary_value, str) else ""
+        full_text = full_value.strip() if isinstance(full_value, str) else ""
+        if not summary_text and not full_text:
+            record_skip("missing_descriptions", record)
+            continue
+
+        state = record.get("state")
+        state_clean = state.strip() if isinstance(state, str) else None
+        if not state_clean or state_clean not in MOUNTAIN_STATES:
+            record_skip("state_not_mountain", record)
+            continue
+
+        filtered.append(record)
+
+    return filtered, skip_stats
 
 
 # Upsert helper
-def upsert_records(connection, table: Table, rows: List[Dict[str, Any]]) -> int:
+def upsert_records(
+    connection,
+    table: Table,
+    rows: List[Dict[str, Any]],
+    returning_columns: Optional[List[Any]] = None,
+) -> Tuple[int, List[Dict[str, Any]]]:
+    if not rows:
+        return 0, []
+    stmt = pg_insert(table).values(rows)
+    stmt = stmt.on_conflict_do_nothing(index_elements=["source_id"])
+    columns = returning_columns or [table.c.source_id]
+    stmt = stmt.returning(*columns)
+    result = connection.execute(stmt)
+    inserted = [dict(row._mapping) for row in result.fetchall()]
+    return len(inserted), inserted
+
+
+def upsert_silver_records(connection, rows: List[Dict[str, Any]]) -> int:
     if not rows:
         return 0
-    stmt = pg_insert(table).values(rows)
-    stmt = stmt.on_conflict_do_nothing(index_elements=["source_id"]).returning(table.c.source_id)
-    result = connection.execute(stmt)
-    inserted = result.fetchall()
-    return len(inserted)
+
+    insert_stmt = pg_insert(accidents_silver).values(rows)
+    excluded = insert_stmt.excluded
+    update_stmt = insert_stmt.on_conflict_do_update(
+        index_elements=[accidents_silver.c.source_id],
+        set_={
+            "season": func.coalesce(excluded.season, accidents_silver.c.season),
+            "date": func.coalesce(excluded.date, accidents_silver.c.date),
+            "display_date": func.coalesce(excluded.display_date, accidents_silver.c.display_date),
+            "state": func.coalesce(excluded.state, accidents_silver.c.state),
+            "location": func.coalesce(excluded.location, accidents_silver.c.location),
+            "summary_description": func.coalesce(
+                excluded.summary_description,
+                accidents_silver.c.summary_description,
+            ),
+            "full_description": func.coalesce(
+                excluded.full_description,
+                accidents_silver.c.full_description,
+            ),
+            "fatalities": func.coalesce(excluded.fatalities, accidents_silver.c.fatalities),
+            "latitude": func.coalesce(excluded.latitude, accidents_silver.c.latitude),
+            "longitude": func.coalesce(excluded.longitude, accidents_silver.c.longitude),
+            "refined_location": func.coalesce(excluded.refined_location, accidents_silver.c.refined_location),
+        },
+    ).returning(accidents_silver.c.source_id)
+
+    result = connection.execute(update_stmt)
+    affected_rows = result.fetchall()
+    return len(affected_rows)
 
 
-# Bronze record selector
-def build_bronze_payload(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    bronze_columns = ["source_id", "season", "date", "state", "location", "description", "fatalities"]
-    return [{col: record.get(col) for col in bronze_columns} for record in records]
+# Bronze record builder
+def build_bronze_payload_raw(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    payload: List[Dict[str, Any]] = []
+    fetched_at = datetime.now(timezone.utc)
+    for record in records:
+        source_id = extract_source_id(record)
+        if not source_id:
+            continue
+        payload.append(
+            {
+                "source_id": source_id,
+                "raw_json": record,
+                "fetched_at": fetched_at,
+                "elt_job_id": ELT_JOB_ID,
+            }
+        )
+    return payload
+
+
+def fetch_bronze_raw_records(
+    connection,
+    elt_job_id: str,
+    rebuild_from_all: bool,
+) -> List[Dict[str, Any]]:
+    query = select(accidents_bronze.c.raw_json).order_by(accidents_bronze.c.id)
+    if not rebuild_from_all:
+        query = query.where(accidents_bronze.c.elt_job_id == elt_job_id)
+    result = connection.execute(query)
+    return [row._mapping["raw_json"] for row in result.fetchall()]
 
 
 # Silver record selector
@@ -438,9 +665,11 @@ def build_silver_payload(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         "source_id",
         "season",
         "date",
+        "display_date",
         "state",
         "location",
-        "description",
+        "summary_description",
+        "full_description",
         "fatalities",
         "latitude",
         "longitude",
@@ -449,12 +678,48 @@ def build_silver_payload(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [{col: record.get(col) for col in silver_columns} for record in records]
 
 
+def enforce_silver_contract(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    valid_rows: List[Dict[str, Any]] = []
+    skipped = 0
+    for row in rows:
+        missing: List[str] = []
+        for field in SILVER_REQUIRED_FIELDS:
+            value = row.get(field)
+            if value is None:
+                missing.append(field)
+                continue
+            if isinstance(value, str) and not value.strip():
+                missing.append(field)
+        if missing:
+            skipped += 1
+            logging.warning(
+                "Silver contract violation for source_id=%s; missing fields: %s",
+                row.get("source_id"),
+                missing,
+            )
+            continue
+        valid_rows.append(row)
+    return valid_rows, skipped
+
+
 # Main workflow
 def main() -> None:
     start_time = datetime.utcnow()
     status = "Failure"
     error_message = None
     data_count = 0
+
+    logging.info(
+        "Run config: elt_job_id=%s api_url=%s dry_run=%s rebuild_all_bronze=%s max_geocode_per_run=%s "
+        "request_timeout=%s max_retries=%s",
+        ELT_JOB_ID,
+        API_URL,
+        DRY_RUN,
+        REBUILD_SILVER_FROM_ALL_BRONZE,
+        MAX_GEOCODE_PER_RUN,
+        REQUEST_TIMEOUT,
+        MAX_RETRIES,
+    )
 
     try:
         # -------------------------
@@ -465,23 +730,21 @@ def main() -> None:
 
         while True:
             page_url = f"{API_URL}?page={page}"
-            raw_data, fetch_error = fetch_api_json(page_url, MAX_RETRIES, REQUEST_TIMEOUT)
+            raw_data, stop_pagination, fetch_error = fetch_api_json(page_url, MAX_RETRIES, REQUEST_TIMEOUT)
 
-            # Stop condition: API explicitly says page is out of range
-            if raw_data is None and fetch_error and "expected :page" in fetch_error and "got" in fetch_error:
-                print(f"Pagination complete. API rejected page {page}: {fetch_error}")
+            if stop_pagination:
+                logging.info("Pagination complete. API rejected page %s: %s", page, fetch_error or "page out of range")
                 break
 
-            # Any other failure is a real error
             if raw_data is None:
                 raise RuntimeError(fetch_error or f"API returned no data on page {page}")
 
             if not isinstance(raw_data, list) or not raw_data:
-                print(f"No records returned on page {page}. Pagination complete.")
+                logging.info("No records returned on page %s. Pagination complete.", page)
                 break
 
             all_records.extend(raw_data)
-            print(f"Fetched page {page}: {len(raw_data)} records (running total: {len(all_records)})")
+            logging.info("Fetched page %s: %s records (running total: %s)", page, len(raw_data), len(all_records))
 
             page += 1
 
@@ -489,27 +752,89 @@ def main() -> None:
             raise RuntimeError("No records fetched from API.")
 
         # -------------------------
-        # NORMALIZATION
+        # BRONZE LOAD
+        # -------------------------
+        bronze_payload = build_bronze_payload_raw(all_records)
+
+        if not bronze_payload:
+            logging.info("No records with valid source IDs available for bronze load.")
+            status = "Success"
+            return
+
+        if DRY_RUN:
+            logging.info("DRY_RUN enabled: skipping bronze insert and DB read; using in-memory payload.")
+            inserted_bronze = 0
+            bronze_raw_records = [row["raw_json"] for row in bronze_payload]
+        else:
+            with engine.begin() as conn:
+                inserted_bronze, _ = upsert_records(
+                    conn,
+                    accidents_bronze,
+                    bronze_payload,
+                    returning_columns=[accidents_bronze.c.source_id],
+                )
+            logging.info("Inserted %s bronze records.", inserted_bronze)
+            if inserted_bronze == 0:
+                if REBUILD_SILVER_FROM_ALL_BRONZE:
+                    logging.info("No new bronze rows inserted; REBUILD_SILVER_FROM_ALL_BRONZE=True so using all bronze rows.")
+                elif not DRY_RUN:
+                    logging.info("No new bronze rows inserted; early exit because rebuild-from-all and DRY_RUN are disabled.")
+                    status = "Success"
+                    data_count = 0
+                    return
+                else:
+                    logging.info("No new bronze rows inserted; limiting silver rebuild to this job's bronze rows.")
+
+            with engine.begin() as conn:
+                bronze_raw_records = fetch_bronze_raw_records(conn, ELT_JOB_ID, REBUILD_SILVER_FROM_ALL_BRONZE)
+
+        if not bronze_raw_records:
+            if DRY_RUN:
+                logging.info("No bronze rows available in DRY_RUN payload; skipping silver load.")
+            elif REBUILD_SILVER_FROM_ALL_BRONZE:
+                logging.info("Bronze table is empty; skipping silver load.")
+            else:
+                logging.info(
+                    "No bronze rows found for this job; skipping silver load. "
+                    "Set REBUILD_SILVER_FROM_ALL_BRONZE=true to rebuild from all bronze."
+                )
+            status = "Success"
+            return
+
+        # -------------------------
+        # NORMALIZATION FROM BRONZE
         # -------------------------
         normalized_records: List[Dict[str, Any]] = []
 
-        for record in all_records:
-            if not isinstance(record, dict):
+        for raw_record in bronze_raw_records:
+            if not isinstance(raw_record, dict):
                 continue
-            normalized = normalize_record(record)
+            normalized = normalize_record(raw_record)
             if normalized:
                 normalized_records.append(normalized)
 
-        print(f"Normalized {len(normalized_records)} records.")
+        logging.info("Normalized %s records from bronze.", len(normalized_records))
 
-        # DEBUG: fatalities coverage
-        non_null_fatalities = sum(
-            1 for r in normalized_records if r.get("fatalities") is not None
+        non_null_fatalities = sum(1 for r in normalized_records if r.get("fatalities") is not None)
+        logging.info("Fatalities non-null after normalize: %s/%s", non_null_fatalities, len(normalized_records))
+        zero_fatalities = sum(1 for r in normalized_records if r.get("fatalities") == 0)
+        positive_fatalities = sum(
+            1 for r in normalized_records if isinstance(r.get("fatalities"), int) and r.get("fatalities") > 0
         )
-        print(f"DEBUG fatalities non-null after normalize: {non_null_fatalities}/{len(normalized_records)}")
+        null_fatalities = len(normalized_records) - zero_fatalities - positive_fatalities
+        logging.info(
+            "Fatalities breakdown: zero=%s, gt0=%s, null=%s",
+            zero_fatalities,
+            positive_fatalities,
+            null_fatalities,
+        )
+        summary_non_null = sum(1 for r in normalized_records if r.get("summary_description"))
+        full_non_null = sum(1 for r in normalized_records if r.get("full_description"))
+        logging.info("summary_description non-null: %s/%s", summary_non_null, len(normalized_records))
+        logging.info("full_description non-null: %s/%s", full_non_null, len(normalized_records))
 
         if not normalized_records:
-            print("No valid records available after normalization.")
+            logging.info("No valid records available after normalization.")
             status = "Success"
             return
 
@@ -521,54 +846,95 @@ def main() -> None:
             if r.get("latitude") is None and r.get("longitude") is None
         )
 
-        enrich_with_geocoding(normalized_records)
+        geocode_stats = enrich_with_geocoding(normalized_records, MAX_GEOCODE_PER_RUN)
 
         missing_after = sum(
             1 for r in normalized_records
             if r.get("latitude") is None and r.get("longitude") is None
         )
 
-        print(f"Geocode fill: {missing_before - missing_after} filled, {missing_after} still missing.")
+        logging.info("Geocode fill: %s filled, %s still missing.", missing_before - missing_after, missing_after)
+        logging.info(
+            "Geocode stats: attempted=%s, succeeded=%s, skipped_cap=%s (max %s).",
+            geocode_stats["attempted"],
+            geocode_stats["succeeded"],
+            geocode_stats["skipped_cap"],
+            MAX_GEOCODE_PER_RUN,
+        )
 
         # -------------------------
         # UPSERT (APPEND-ONLY)
         # -------------------------
-        bronze_payload = build_bronze_payload(normalized_records)
-        silver_payload = build_silver_payload(normalized_records)
+        silver_candidates, skip_stats = filter_silver_records(normalized_records)
+        skipped_total = sum(stat["count"] for stat in skip_stats.values())
+        logging.info(
+            "Silver quality filter: total=%s, kept=%s, skipped=%s",
+            len(normalized_records),
+            len(silver_candidates),
+            skipped_total,
+        )
+        for reason, stat in skip_stats.items():
+            samples = ", ".join(filter(None, stat["samples"]))
+            sample_text = f" [samples: {samples}]" if samples else ""
+            logging.info("Silver quality filter detail: %s=%s%s", reason, stat["count"], sample_text)
 
-        with engine.begin() as conn:
-            inserted_bronze = upsert_records(conn, accidents_bronze, bronze_payload)
-            print(f"Inserted {inserted_bronze} bronze records.")
+        raw_silver_payload = build_silver_payload(silver_candidates)
+        silver_payload, contract_skipped = enforce_silver_contract(raw_silver_payload)
+        if contract_skipped:
+            logging.warning("Silver contract filter removed %s rows missing required fields.", contract_skipped)
 
-            inserted_silver = upsert_records(conn, accidents_silver, silver_payload)
-            print(f"Inserted {inserted_silver} silver records.")
+        if DRY_RUN:
+            sample_sources = [record.get("source_id") for record in silver_payload[:5]]
+            logging.info("DRY_RUN sample silver candidate source_ids (max 5): %s", sample_sources)
 
-        data_count = inserted_silver
+        if not silver_payload:
+            silver_upserted = 0
+            logging.info("No records passed silver quality filters; skipping silver upsert.")
+        elif DRY_RUN:
+            silver_upserted = 0
+            logging.info("DRY_RUN enabled: skipping silver upsert for %s records.", len(silver_payload))
+        else:
+            with engine.begin() as conn:
+                silver_upserted = upsert_silver_records(conn, silver_payload)
+                logging.info("Silver rows touched: %s", silver_upserted)
+
+        data_count = silver_upserted
         status = "Success"
 
     except Exception as run_err:
         error_message = str(run_err)
-        print(f"ELT run failed: {error_message}")
+        logging.error("ELT run failed: %s", error_message)
 
     finally:
         end_time = datetime.utcnow()
         duration = end_time - start_time
 
-        try:
-            insert_log(
-                elt_job_id=ELT_JOB_ID,
-                start_time=start_time,
-                end_time=end_time,
-                duration=duration,
-                status=status,
-                data_count=data_count,
-                error_message=error_message if status != "Success" else None,
+        if DRY_RUN:
+            logging.info(
+                "DRY_RUN enabled: skipping log insert. status=%s, data_count=%s, error_message=%s",
+                status,
+                data_count,
+                error_message,
             )
-        except Exception as log_err:
-            print(f"Failed to record log entry: {log_err}")
+        else:
+            try:
+                insert_log(
+                    elt_job_id=ELT_JOB_ID,
+                    start_time=start_time,
+                    end_time=end_time,
+                    duration=duration,
+                    status=status,
+                    data_count=data_count,
+                    error_message=error_message if status != "Success" else None,
+                )
+            except Exception as log_err:
+                logging.error("Failed to record log entry: %s", log_err)
 
         if status == "Success":
-            invalidate_cache(CACHE_INVALIDATION_ENDPOINT, FAST_API_KEY)
+            if DRY_RUN:
+                logging.info("DRY_RUN enabled: skipping cache invalidation.")
+            else:
+                invalidate_cache(CACHE_INVALIDATION_ENDPOINT, FAST_API_KEY)
 
 
 
