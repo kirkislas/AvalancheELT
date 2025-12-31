@@ -3,6 +3,7 @@ import os
 
 # Time
 import time
+import math
 from datetime import datetime, timezone
 
 # Typing
@@ -91,7 +92,32 @@ MOUNTAIN_STATES = {
     "Washington",
     "Wyoming",
 }
-SILVER_REQUIRED_FIELDS = ["source_id", "date", "state", "location"]
+SILVER_REQUIRED_STRING_FIELDS = [
+    "source_id",
+    "display_date",
+    "state",
+    "location",
+    "summary_description",
+]
+SILVER_REQUIRED_NUMERIC_FIELDS = ["latitude", "longitude"]
+PLACEHOLDER_TOKENS = {"unknown", "n/a", "na", "null", "none", "-"}
+MIN_EXTENDED_CHARS = 140
+EXTENDED_DESCRIPTION_BLOCKLIST = {"none additional"}
+EXTENDED_DESCRIPTION_BLOCKLIST_LOWER = {token.lower() for token in EXTENDED_DESCRIPTION_BLOCKLIST}
+SILVER_COLUMNS = [
+    "source_id",
+    "season",
+    "date",
+    "display_date",
+    "state",
+    "location",
+    "summary_description",
+    "full_description",
+    "fatalities",
+    "latitude",
+    "longitude",
+    "refined_location",
+]
 
 
 def parse_page_out_of_range(response: requests.Response) -> Tuple[bool, Optional[str]]:
@@ -212,8 +238,7 @@ def refine_location(state, location):
         if not loc_str:
             return None
 
-        unknown_tokens = {"unknown", "n/a", "na", "null", "none", "-"}
-        if loc_str.lower().strip(" ,") in unknown_tokens:
+        if loc_str.lower().strip(" ,") in PLACEHOLDER_TOKENS:
             return None
 
         if "," in loc_str:
@@ -233,7 +258,7 @@ def refine_location(state, location):
 
         refined_lower = refined_location.lower()
         refined_leading_token = refined_lower.split(",")[0].strip()
-        if refined_leading_token in unknown_tokens:
+        if refined_leading_token in PLACEHOLDER_TOKENS:
             return None
 
         if state:
@@ -265,6 +290,20 @@ def strip_html(text: Optional[str]) -> Optional[str]:
     working = "\n".join(lines)
     working = re.sub(r"\n{3,}", "\n\n", working).strip()
     return working or None
+
+
+def clean_string(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned if cleaned else None
+
+
+def is_placeholder_string(value: Any) -> bool:
+    cleaned = clean_string(value)
+    if not cleaned:
+        return False
+    return cleaned.lower() in PLACEHOLDER_TOKENS
 
 
 # Fatality parsing helper
@@ -418,6 +457,10 @@ def extract_source_id(record: Dict[str, Any]) -> Optional[str]:
 
 
 # Record normalization helper
+# Silver v2 represents display-ready rows that meet a strict contract (no defensive filtering needed downstream).
+# summary_description is mandatory because the frontend requires a human-readable summary without synthesizing counts.
+# Invalid rows are excluded rather than patched to preserve source truth and avoid masking upstream data issues.
+# Frontend should not re-filter because the contract is enforced here to keep the UI thin and predictable.
 def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     source_id = extract_source_id(record)
     if not source_id:
@@ -434,21 +477,13 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     summary_description = None
     detail_summary = public_detail.get("involvement_summary")
     if isinstance(detail_summary, str):
-        summary_description = strip_html(detail_summary)
+        summary_description = clean_string(strip_html(detail_summary))
     if not summary_description:
         involvement_summary = record.get("involvement_summary")
-        if isinstance(involvement_summary, dict):
-            parts: List[str] = []
-            for key in ["involved", "caught", "buried", "injured", "killed"]:
-                value = involvement_summary.get(key)
-                if value is None:
-                    continue
-                value_str = str(value).strip()
-                if not value_str:
-                    continue
-                parts.append(f"{value_str} {key}")
-            if parts:
-                summary_description = ", ".join(parts)
+        if isinstance(involvement_summary, str):
+            summary_description = clean_string(strip_html(involvement_summary))
+    if is_placeholder_string(summary_description):
+        summary_description = None
 
     full_text_source = (
         public_detail.get("accident_summary")
@@ -458,11 +493,23 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     full_description = strip_html(full_text_source)
     if not full_description:
         full_description = strip_html(record.get("description"))
+    if isinstance(full_description, str):
+        normalized_full = full_description.strip()
+        if normalized_full.lower() in EXTENDED_DESCRIPTION_BLOCKLIST_LOWER:
+            full_description = None
+        elif len(normalized_full) < MIN_EXTENDED_CHARS:
+            full_description = None
+        else:
+            full_description = normalized_full
 
     state_value = convert_state_name(record.get("state") or record.get("state_abbr"))
     fatalities = parse_fatalities(record)
     latitude, longitude = extract_coordinates(record)
     refined = refine_location(state_value, location_value)
+    display_location = refined if isinstance(refined, str) and refined.strip() else location_value
+    display_location = clean_string(display_location)
+    if is_placeholder_string(display_location):
+        display_location = None
 
     return {
         "source_id": source_id,
@@ -470,7 +517,7 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "date": iso_date,
         "display_date": display_date,
         "state": state_value,
-        "location": location_value,
+        "location": display_location,
         "summary_description": summary_description,
         "full_description": full_description,
         "fatalities": fatalities,
@@ -532,9 +579,11 @@ def enrich_with_geocoding(records: List[Dict[str, Any]], max_attempts: int = MAX
 
 def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
     skip_stats: Dict[str, Dict[str, Any]] = {
-        "missing_coordinates": {"count": 0, "samples": []},
-        "missing_refined_location": {"count": 0, "samples": []},
-        "missing_descriptions": {"count": 0, "samples": []},
+        "missing_required_fields": {"count": 0, "samples": []},
+        "placeholder_required_fields": {"count": 0, "samples": []},
+        "missing_summary_description": {"count": 0, "samples": []},
+        "placeholder_summary_description": {"count": 0, "samples": []},
+        "invalid_coordinates": {"count": 0, "samples": []},
         "state_not_mountain": {"count": 0, "samples": []},
     }
     filtered: List[Dict[str, Any]] = []
@@ -546,23 +595,54 @@ def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
             info["samples"].append(record.get("source_id"))
 
     for record in records:
-        lat = record.get("latitude")
-        lon = record.get("longitude")
-        if lat is None or lon is None:
-            record_skip("missing_coordinates", record)
-            continue
-
-        refined = record.get("refined_location")
-        if not isinstance(refined, str) or not refined.strip():
-            record_skip("missing_refined_location", record)
-            continue
-
         summary_value = record.get("summary_description")
-        full_value = record.get("full_description")
-        summary_text = summary_value.strip() if isinstance(summary_value, str) else ""
-        full_text = full_value.strip() if isinstance(full_value, str) else ""
-        if not summary_text and not full_text:
-            record_skip("missing_descriptions", record)
+        summary_clean = clean_string(summary_value)
+        if summary_clean is None:
+            record_skip("missing_summary_description", record)
+            continue
+        if is_placeholder_string(summary_clean):
+            record_skip("placeholder_summary_description", record)
+            continue
+
+        missing_fields: List[str] = []
+        placeholder_fields: List[str] = []
+        for field in (field for field in SILVER_REQUIRED_STRING_FIELDS if field != "summary_description"):
+            value = record.get(field)
+            if clean_string(value) is None:
+                missing_fields.append(field)
+                continue
+            if is_placeholder_string(value):
+                placeholder_fields.append(field)
+        if missing_fields:
+            record_skip("missing_required_fields", record)
+            continue
+        if placeholder_fields:
+            record_skip("placeholder_required_fields", record)
+            continue
+
+        numeric_values = {
+            field: record.get(field) for field in SILVER_REQUIRED_NUMERIC_FIELDS
+        }
+        invalid_coordinates = False
+        for field in SILVER_REQUIRED_NUMERIC_FIELDS:
+            value = numeric_values.get(field)
+            if isinstance(value, bool):
+                invalid_coordinates = True
+                break
+            if value is None or not isinstance(value, (int, float)):
+                invalid_coordinates = True
+                break
+            if not math.isfinite(value):
+                invalid_coordinates = True
+                break
+            if field == "latitude" and not (-90 <= value <= 90):
+                invalid_coordinates = True
+                break
+            if field == "longitude" and not (-180 <= value <= 180):
+                invalid_coordinates = True
+                break
+        if invalid_coordinates:
+            record_skip("invalid_coordinates", record)
             continue
 
         state = record.get("state")
@@ -661,50 +741,52 @@ def fetch_bronze_raw_records(
 
 # Silver record selector
 def build_silver_payload(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    silver_columns = [
-        "source_id",
-        "season",
-        "date",
-        "display_date",
-        "state",
-        "location",
-        "summary_description",
-        "full_description",
-        "fatalities",
-        "latitude",
-        "longitude",
-        "refined_location",
-    ]
-    return [{col: record.get(col) for col in silver_columns} for record in records]
+    return [{col: record.get(col) for col in SILVER_COLUMNS} for record in records]
 
 
-def enforce_silver_contract(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
-    valid_rows: List[Dict[str, Any]] = []
-    skipped = 0
+def assert_silver_contract(rows: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int, List[Optional[str]]]:
+    violations = 0
+    samples: List[Optional[str]] = []
     for row in rows:
-        missing: List[str] = []
-        for field in SILVER_REQUIRED_FIELDS:
+        invalid_fields: List[str] = []
+        for field in SILVER_REQUIRED_STRING_FIELDS:
             value = row.get(field)
-            if value is None:
-                missing.append(field)
+            if clean_string(value) is None:
+                invalid_fields.append(field)
                 continue
-            if isinstance(value, str) and not value.strip():
-                missing.append(field)
-        if missing:
-            skipped += 1
+            if is_placeholder_string(value):
+                invalid_fields.append(field)
+        for field in SILVER_REQUIRED_NUMERIC_FIELDS:
+            value = row.get(field)
+            if isinstance(value, bool):
+                invalid_fields.append(field)
+                continue
+            if value is None or not isinstance(value, (int, float)):
+                invalid_fields.append(field)
+                continue
+            if not math.isfinite(value):
+                invalid_fields.append(field)
+                continue
+            if field == "latitude" and not (-90 <= value <= 90):
+                invalid_fields.append(field)
+                continue
+            if field == "longitude" and not (-180 <= value <= 180):
+                invalid_fields.append(field)
+        if invalid_fields:
+            violations += 1
+            if len(samples) < 5:
+                samples.append(row.get("source_id"))
             logging.warning(
-                "Silver contract violation for source_id=%s; missing fields: %s",
+                "Silver contract assertion for source_id=%s; invalid fields: %s",
                 row.get("source_id"),
-                missing,
+                invalid_fields,
             )
-            continue
-        valid_rows.append(row)
-    return valid_rows, skipped
+    return rows, violations, samples
 
 
 # Main workflow
 def main() -> None:
-    start_time = datetime.utcnow()
+    start_time = datetime.now(timezone.utc)
     status = "Failure"
     error_message = None
     data_count = 0
@@ -720,6 +802,18 @@ def main() -> None:
         REQUEST_TIMEOUT,
         MAX_RETRIES,
     )
+    logging.info(
+        "Silver rebuild mode: %s",
+        "all bronze rows" if REBUILD_SILVER_FROM_ALL_BRONZE else "current elt_job_id only",
+    )
+    # TODO: If any v2 columns are missing from accidents_silver, apply a migration outside this ELT job.
+    silver_table_columns = set(accidents_silver.c.keys())
+    missing_silver_columns = [col for col in SILVER_COLUMNS if col not in silver_table_columns]
+    if missing_silver_columns:
+        logging.warning(
+            "accidents_silver missing v2 columns: %s",
+            ", ".join(missing_silver_columns),
+        )
 
     try:
         # -------------------------
@@ -813,7 +907,29 @@ def main() -> None:
             if normalized:
                 normalized_records.append(normalized)
 
-        logging.info("Normalized %s records from bronze.", len(normalized_records))
+        normalized_samples = [record.get("source_id") for record in normalized_records[:5]]
+        normalized_sample_text = ", ".join(filter(None, normalized_samples))
+        logging.info(
+            "Normalized rows: %s%s",
+            len(normalized_records),
+            f" [samples: {normalized_sample_text}]" if normalized_sample_text else "",
+        )
+
+        missing_summary_sources: List[Optional[str]] = []
+        missing_summary_count = 0
+        for record in normalized_records:
+            summary_value = record.get("summary_description")
+            summary_text = summary_value.strip() if isinstance(summary_value, str) else ""
+            if not summary_text:
+                missing_summary_count += 1
+                if len(missing_summary_sources) < 5:
+                    missing_summary_sources.append(record.get("source_id"))
+        missing_summary_sample = ", ".join(filter(None, missing_summary_sources))
+        logging.info(
+            "Missing summary_description: %s%s",
+            missing_summary_count,
+            f" [samples: {missing_summary_sample}]" if missing_summary_sample else "",
+        )
 
         non_null_fatalities = sum(1 for r in normalized_records if r.get("fatalities") is not None)
         logging.info("Fatalities non-null after normalize: %s/%s", non_null_fatalities, len(normalized_records))
@@ -867,21 +983,79 @@ def main() -> None:
         # -------------------------
         silver_candidates, skip_stats = filter_silver_records(normalized_records)
         skipped_total = sum(stat["count"] for stat in skip_stats.values())
+        candidate_samples = [record.get("source_id") for record in silver_candidates[:5]]
+        candidate_sample_text = ", ".join(filter(None, candidate_samples))
         logging.info(
-            "Silver quality filter: total=%s, kept=%s, skipped=%s",
-            len(normalized_records),
+            "Silver candidates: %s%s",
             len(silver_candidates),
-            skipped_total,
+            f" [samples: {candidate_sample_text}]" if candidate_sample_text else "",
         )
+        logging.info("Silver quality filter: total=%s, kept=%s, skipped=%s", len(normalized_records), len(silver_candidates), skipped_total)
         for reason, stat in skip_stats.items():
             samples = ", ".join(filter(None, stat["samples"]))
             sample_text = f" [samples: {samples}]" if samples else ""
             logging.info("Silver quality filter detail: %s=%s%s", reason, stat["count"], sample_text)
+        invalid_samples = ", ".join(filter(None, skip_stats["invalid_coordinates"]["samples"]))
+        logging.info(
+            "Invalid coordinate rejections: %s%s",
+            skip_stats["invalid_coordinates"]["count"],
+            f" [samples: {invalid_samples}]" if invalid_samples else "",
+        )
 
         raw_silver_payload = build_silver_payload(silver_candidates)
-        silver_payload, contract_skipped = enforce_silver_contract(raw_silver_payload)
-        if contract_skipped:
-            logging.warning("Silver contract filter removed %s rows missing required fields.", contract_skipped)
+        silver_payload, contract_assertion_count, contract_samples = assert_silver_contract(raw_silver_payload)
+        if contract_assertion_count:
+            sample_text = ", ".join(filter(None, contract_samples))
+            logging.warning(
+                "Silver contract assertion flagged %s rows (log-only; filter enforces).%s",
+                contract_assertion_count,
+                f" [samples: {sample_text}]" if sample_text else "",
+            )
+        dropped_by_filters = len(normalized_records) - len(silver_candidates)
+        logging.info(
+            "Silver candidate metrics: total_normalized=%s candidates=%s dropped_by_state=%s dropped_by_filters=%s",
+            len(normalized_records),
+            len(silver_candidates),
+            skip_stats["state_not_mountain"]["count"],
+            dropped_by_filters,
+        )
+        logging.info("Silver contract assertion count (log-only)=%s", contract_assertion_count)
+        silver_columns = [
+            "source_id",
+            "season",
+            "date",
+            "display_date",
+            "state",
+            "location",
+            "summary_description",
+            "full_description",
+            "fatalities",
+            "latitude",
+            "longitude",
+            "refined_location",
+        ]
+        null_counts = {
+            column: sum(1 for row in silver_payload if row.get(column) is None)
+            for column in silver_columns
+        }
+        logging.info(
+            "Silver payload: total=%s nulls=%s",
+            len(silver_payload),
+            null_counts,
+        )
+        sample_records = silver_payload[:3]
+        for record in sample_records:
+            summary_value = record.get("summary_description")
+            full_value = record.get("full_description")
+            logging.info(
+                "Silver sample: source_id=%s location=%s state=%s display_date=%s summary_len=%s full_len=%s",
+                record.get("source_id"),
+                record.get("location"),
+                record.get("state"),
+                record.get("display_date"),
+                len(summary_value) if isinstance(summary_value, str) else 0,
+                len(full_value) if isinstance(full_value, str) else 0,
+            )
 
         if DRY_RUN:
             sample_sources = [record.get("source_id") for record in silver_payload[:5]]
@@ -906,7 +1080,7 @@ def main() -> None:
         logging.error("ELT run failed: %s", error_message)
 
     finally:
-        end_time = datetime.utcnow()
+        end_time = datetime.now(timezone.utc)
         duration = end_time - start_time
 
         if DRY_RUN:
