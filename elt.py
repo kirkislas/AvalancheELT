@@ -387,6 +387,7 @@ def test_filter_silver_records_no_state_filter() -> None:
         "state": "California",
         "location": "Test Location",
         "summary_description": "Summary",
+        "fatalities": 1,
         "latitude": 39.0,
         "longitude": -120.0,
     }
@@ -723,6 +724,7 @@ def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
         "missing_summary_description": {"count": 0, "samples": []},
         "placeholder_summary_description": {"count": 0, "samples": []},
         "invalid_coordinates": {"count": 0, "samples": []},
+        "fatalities_not_positive": {"count": 0, "samples": []},
     }
     filtered: List[Dict[str, Any]] = []
 
@@ -781,6 +783,11 @@ def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
                 break
         if invalid_coordinates:
             record_skip("invalid_coordinates", record)
+            continue
+
+        fatalities = record.get("fatalities")
+        if not isinstance(fatalities, int) or fatalities <= 0:
+            record_skip("fatalities_not_positive", record)
             continue
 
         filtered.append(record)
