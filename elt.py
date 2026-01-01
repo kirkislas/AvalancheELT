@@ -49,6 +49,7 @@ REBUILD_SILVER_FROM_ALL_BRONZE = (
 )
 MAX_GEOCODE_PER_RUN = int(os.environ.get("MAX_GEOCODE_PER_RUN", "50"))
 DRY_RUN = os.environ.get("DRY_RUN", "false").strip().lower() in {"1", "true", "yes", "y"}
+RUN_TESTS = os.environ.get("RUN_TESTS", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,21 +78,6 @@ if GOOGLE_MAPS_API_KEY:
         gmaps_client = None
 
 GEOCODE_CACHE: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
-MOUNTAIN_STATES = {
-    "Alaska",
-    "California",
-    "Colorado",
-    "Idaho",
-    "Montana",
-    "Nevada",
-    "New Hampshire",
-    "New Mexico",
-    "Oregon",
-    "Utah",
-    "Vermont",
-    "Washington",
-    "Wyoming",
-}
 SILVER_REQUIRED_STRING_FIELDS = [
     "source_id",
     "display_date",
@@ -101,6 +87,28 @@ SILVER_REQUIRED_STRING_FIELDS = [
 ]
 SILVER_REQUIRED_NUMERIC_FIELDS = ["latitude", "longitude"]
 PLACEHOLDER_TOKENS = {"unknown", "n/a", "na", "null", "none", "-"}
+LOCATION_STOPWORDS = {
+    "of",
+    "the",
+    "and",
+    "near",
+    "approx",
+    "approximate",
+    "mi",
+    "mile",
+    "miles",
+    "km",
+    "kilometer",
+    "kilometers",
+    "n",
+    "s",
+    "e",
+    "w",
+    "ne",
+    "nw",
+    "se",
+    "sw",
+}
 MIN_EXTENDED_CHARS = 140
 EXTENDED_DESCRIPTION_BLOCKLIST = {"none additional"}
 EXTENDED_DESCRIPTION_BLOCKLIST_LOWER = {token.lower() for token in EXTENDED_DESCRIPTION_BLOCKLIST}
@@ -229,17 +237,98 @@ def convert_state_name(value: Optional[str]) -> Optional[str]:
 
 
 # Location refinement helper
+def normalize_location_whitespace(value: str) -> str:
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def resolve_state_tokens(state: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    if not state:
+        return None, None
+    lookup = us.states.lookup(state)
+    if lookup:
+        return normalize_location_whitespace(lookup.name), lookup.abbr
+    cleaned = normalize_location_whitespace(str(state))
+    return cleaned or None, None
+
+
+def location_contains_state(state: Optional[str], location: Optional[str]) -> bool:
+    if not state or not location:
+        return False
+    loc_str = normalize_location_whitespace(str(location))
+    if not loc_str:
+        return False
+    state_name, state_abbr = resolve_state_tokens(state)
+    for token in (state_name, state_abbr):
+        if token and re.search(rf"\b{re.escape(token)}\b", loc_str, re.IGNORECASE):
+            return True
+    return False
+
+
+def is_state_token_only(value: Optional[str], state: Optional[str]) -> bool:
+    if not value or not state:
+        return False
+    normalized = normalize_location_whitespace(str(value))
+    if not normalized:
+        return False
+    state_name, state_abbr = resolve_state_tokens(state)
+    for token in (state_name, state_abbr):
+        if token and normalized.lower() == token.lower():
+            return True
+    return False
+
+
+def meaningful_location_tokens(text: Optional[str], state: Optional[str]) -> set:
+    if not text:
+        return set()
+    normalized = normalize_location_whitespace(str(text)).lower()
+    tokens = re.findall(r"[A-Za-z0-9]+", normalized)
+    state_name, state_abbr = resolve_state_tokens(state)
+    state_tokens = set()
+    if state_name:
+        state_tokens.update(re.findall(r"[A-Za-z0-9]+", state_name.lower()))
+    if state_abbr:
+        state_tokens.add(state_abbr.lower())
+    return {
+        token
+        for token in tokens
+        if token not in LOCATION_STOPWORDS and token not in state_tokens and not token.isdigit()
+    }
+
+
+def is_refinement_degraded(original: Optional[str], refined: Optional[str], state: Optional[str]) -> bool:
+    if not original or not refined:
+        return False
+    original_norm = normalize_location_whitespace(str(original))
+    refined_norm = normalize_location_whitespace(str(refined))
+    if original_norm.lower() == refined_norm.lower():
+        return False
+    if is_state_token_only(refined_norm, state):
+        return True
+    if len(refined_norm) >= len(original_norm):
+        return False
+    original_tokens = meaningful_location_tokens(original_norm, state)
+    refined_tokens = meaningful_location_tokens(refined_norm, state)
+    if not refined_tokens:
+        return True
+    if original_tokens and refined_tokens < original_tokens:
+        return True
+    return False
+
+
 def refine_location(state, location):
     try:
         if location is None:
             return None
 
-        loc_str = str(location).strip()
+        loc_str = normalize_location_whitespace(str(location))
         if not loc_str:
             return None
 
         if loc_str.lower().strip(" ,") in PLACEHOLDER_TOKENS:
             return None
+
+        if location_contains_state(state, loc_str):
+            return loc_str
 
         if "," in loc_str:
             last_comma_part = loc_str.split(",")[-1].strip()
@@ -252,7 +341,7 @@ def refine_location(state, location):
         else:
             refined_location = loc_str
 
-        refined_location = refined_location.strip()
+        refined_location = normalize_location_whitespace(refined_location)
         if not refined_location:
             return None
 
@@ -261,12 +350,58 @@ def refine_location(state, location):
         if refined_leading_token in PLACEHOLDER_TOKENS:
             return None
 
+        if location_contains_state(state, refined_location):
+            return refined_location
+
         if state:
-            return f"{refined_location}, {state}"
+            state_name, _ = resolve_state_tokens(state)
+            return f"{refined_location}, {state_name or state}"
         return refined_location
     except Exception:
         logging.exception("Refine location failed for state=%s location=%s", state, location)
         return None
+
+
+def run_location_refinement_tests() -> None:
+    cases = [
+        ("California", "Angora Peak, Echo Pass, CA", "Angora Peak, Echo Pass, CA"),
+        ("Idaho", "Rock Creek, Idaho", "Rock Creek, Idaho"),
+        ("Idaho", "Idaho", "Idaho"),
+        ("Washington", "Cowboy Mountain, Washington", "Cowboy Mountain, Washington"),
+        ("Utah", "2 mi NE of Alta", "Alta, Utah"),
+    ]
+    for state, location, expected in cases:
+        refined = refine_location(state, location)
+        assert refined == expected, f"refine_location({state!r}, {location!r}) -> {refined!r}"
+        record = {"id": "test", "state": state, "location": location}
+        normalized = normalize_record(record)
+        assert normalized is not None, "normalize_record returned None"
+        assert normalized["location"] == expected, f"normalize_record location -> {normalized['location']!r}"
+    logging.info("Location refinement tests passed: %s", len(cases))
+
+
+def test_filter_silver_records_no_state_filter() -> None:
+    base_record = {
+        "source_id": "test:1",
+        "display_date": "01-01-2024",
+        "state": "California",
+        "location": "Test Location",
+        "summary_description": "Summary",
+        "latitude": 39.0,
+        "longitude": -120.0,
+    }
+    texas_record = dict(base_record)
+    texas_record.update({"source_id": "test:2", "state": "Texas"})
+    invalid_coords = dict(base_record)
+    invalid_coords.update({"source_id": "test:3", "latitude": 999.0})
+
+    filtered, skip_stats = filter_silver_records([base_record, texas_record, invalid_coords])
+    filtered_ids = {record["source_id"] for record in filtered}
+    assert "test:1" in filtered_ids, "Mountain state record unexpectedly filtered"
+    assert "test:2" in filtered_ids, "Non-mountain state record unexpectedly filtered"
+    assert "test:3" not in filtered_ids, "Invalid coordinates record unexpectedly kept"
+    assert skip_stats["invalid_coordinates"]["count"] == 1, "Invalid coordinate count mismatch"
+    logging.info("Silver filter state removal test passed.")
 
 
 def strip_html(text: Optional[str]) -> Optional[str]:
@@ -506,7 +641,11 @@ def normalize_record(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     fatalities = parse_fatalities(record)
     latitude, longitude = extract_coordinates(record)
     refined = refine_location(state_value, location_value)
-    display_location = refined if isinstance(refined, str) and refined.strip() else location_value
+    cleaned_location = clean_string(location_value) if isinstance(location_value, str) else None
+    cleaned_refined = clean_string(refined) if isinstance(refined, str) else None
+    display_location = cleaned_refined or cleaned_location
+    if cleaned_refined and cleaned_location and is_refinement_degraded(cleaned_location, cleaned_refined, state_value):
+        display_location = cleaned_location
     display_location = clean_string(display_location)
     if is_placeholder_string(display_location):
         display_location = None
@@ -584,7 +723,6 @@ def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
         "missing_summary_description": {"count": 0, "samples": []},
         "placeholder_summary_description": {"count": 0, "samples": []},
         "invalid_coordinates": {"count": 0, "samples": []},
-        "state_not_mountain": {"count": 0, "samples": []},
     }
     filtered: List[Dict[str, Any]] = []
 
@@ -643,12 +781,6 @@ def filter_silver_records(records: List[Dict[str, Any]]) -> Tuple[List[Dict[str,
                 break
         if invalid_coordinates:
             record_skip("invalid_coordinates", record)
-            continue
-
-        state = record.get("state")
-        state_clean = state.strip() if isinstance(state, str) else None
-        if not state_clean or state_clean not in MOUNTAIN_STATES:
-            record_skip("state_not_mountain", record)
             continue
 
         filtered.append(record)
@@ -1013,10 +1145,9 @@ def main() -> None:
             )
         dropped_by_filters = len(normalized_records) - len(silver_candidates)
         logging.info(
-            "Silver candidate metrics: total_normalized=%s candidates=%s dropped_by_state=%s dropped_by_filters=%s",
+            "Silver candidate metrics: total_normalized=%s candidates=%s dropped_by_filters=%s",
             len(normalized_records),
             len(silver_candidates),
-            skip_stats["state_not_mountain"]["count"],
             dropped_by_filters,
         )
         logging.info("Silver contract assertion count (log-only)=%s", contract_assertion_count)
@@ -1115,4 +1246,7 @@ def main() -> None:
 
 # Entrypoint
 if __name__ == "__main__":
+    if RUN_TESTS:
+        run_location_refinement_tests()
+        test_filter_silver_records_no_state_filter()
     main()
